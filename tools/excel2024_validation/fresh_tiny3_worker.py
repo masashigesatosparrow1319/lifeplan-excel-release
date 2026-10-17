@@ -7,31 +7,77 @@ import sys
 import time
 
 from .common import sha
-from .fresh_tiny3 import FRESH_SCHEMA, _write_new_json, require, validate_control
+from .fresh_tiny3 import (FRESH_SCHEMA, Blocked, _write_new_json, require,
+                          validate_control, write_precom_failure)
 
 
-def main(request_path, *, process_identity=None, worker_main=None, pause=time.sleep):
-    from . import functions24, worker
+def main(request_path, *, process_identity=None, worker_main=None, pause=time.sleep,
+         write_new=_write_new_json):
+    from . import functions24
     process_identity = process_identity or functions24.process_identity
-    worker_main = worker_main or worker.main
     request_path = Path(request_path).resolve()
-    require(request_path.is_file() and request_path.stat().st_size <= 131072, 'REQUEST_FILE_INVALID')
-    request = json.loads(request_path.read_text(encoding='utf-8-sig'))
     directory = request_path.parent
-    actual = validate_control(request, directory, process_identity=process_identity)
-    actual = dict(actual, sys_executable=sys.executable)
-    proof = dict(schema=FRESH_SCHEMA, request_sha256=sha(request_path), process=actual)
-    proof_path = directory / 'python-worker.json'
-    _write_new_json(proof_path, proof)
-    deadline = time.monotonic() + 15
-    authorization = directory / 'launch-authorization.json'
-    while not authorization.is_file():
+    stage = 'WORKER_REQUEST_PARSE'
+
+    def reason_for(stage_value, error):
+        fixed = str(error) if isinstance(error, Blocked) else ''
+        if stage_value == 'WORKER_REQUEST_PARSE':
+            return 'REQUEST_FILE_INVALID' if fixed == 'REQUEST_FILE_INVALID' else 'REQUEST_JSON_INVALID'
+        if isinstance(error, RuntimeError) and not fixed \
+                and stage_value != 'WORKER_PROCESS_IDENTITY':
+            return 'PRECOM_UNKNOWN'
+        if stage_value == 'WORKER_CONTROL_VALIDATE': return 'CONTROL_BINDING_INVALID'
+        if stage_value == 'WORKER_MANIFEST_VALIDATE': return 'MANIFEST_INVALID'
+        if stage_value == 'WORKER_MARKER_VALIDATE': return 'APPROVAL_MARKER_INVALID'
+        if stage_value == 'WORKER_PROFILE_VALIDATE': return 'PROFILE_BINDING_INVALID'
+        if stage_value == 'WORKER_PROCESS_IDENTITY':
+            return ('PARENT_IDENTITY_MISMATCH' if fixed == 'ACTUAL_PARENT_MISMATCH'
+                    else 'PROCESS_IDENTITY_UNAVAILABLE')
+        if stage_value == 'WORKER_PROOF_CREATE': return 'PROOF_CREATE_FAILED'
+        if stage_value == 'WORKER_AUTHORIZATION_WAIT':
+            return 'PARENT_STOPPED' if fixed == 'PARENT_STOP_BEFORE_COM' else 'AUTHORIZATION_TIMEOUT'
+        if stage_value == 'WORKER_AUTHORIZATION_VALIDATE': return 'AUTHORIZATION_INVALID'
+        if stage_value == 'WORKER_HANDOFF_CHECK':
+            return ('PARENT_STOPPED' if fixed == 'PARENT_STOP_BEFORE_COM'
+                    else 'PRECOM_FAILURE_BEFORE_HANDOFF')
+        return 'PRECOM_UNKNOWN'
+
+    try:
+        require(request_path.is_file() and request_path.stat().st_size <= 131072,
+                'REQUEST_FILE_INVALID')
+        request = json.loads(request_path.read_text(encoding='utf-8-sig'))
+        def observed(value):
+            nonlocal stage
+            stage = value
+        stage = 'WORKER_CONTROL_VALIDATE'
+        actual = validate_control(request, directory, process_identity=process_identity,
+                                  observe_stage=observed)
+        actual = dict(actual, sys_executable=sys.executable)
+        proof = dict(schema=FRESH_SCHEMA, request_sha256=sha(request_path), process=actual)
+        proof_path = directory / 'python-worker.json'
+        stage = 'WORKER_PROOF_CREATE'
+        write_new(proof_path, proof)
+        deadline = time.monotonic() + 15
+        authorization = directory / 'launch-authorization.json'
+        stage = 'WORKER_AUTHORIZATION_WAIT'
+        while not authorization.is_file():
+            require(not (directory / 'STOP').exists(), 'PARENT_STOP_BEFORE_COM')
+            require(time.monotonic() < deadline, 'LAUNCH_AUTHORIZATION_TIMEOUT')
+            pause(.05)
+        stage = 'WORKER_AUTHORIZATION_VALIDATE'
+        value = json.loads(authorization.read_text(encoding='utf-8-sig'))
+        require(value == dict(schema=FRESH_SCHEMA, request_sha256=proof['request_sha256'],
+                              worker_sha256=sha(proof_path)), 'LAUNCH_AUTHORIZATION_MISMATCH')
+        stage = 'WORKER_HANDOFF_CHECK'
         require(not (directory / 'STOP').exists(), 'PARENT_STOP_BEFORE_COM')
-        require(time.monotonic() < deadline, 'LAUNCH_AUTHORIZATION_TIMEOUT')
-        pause(.05)
-    value = json.loads(authorization.read_text(encoding='utf-8-sig'))
-    require(value == dict(schema=FRESH_SCHEMA, request_sha256=proof['request_sha256'],
-                          worker_sha256=sha(proof_path)), 'LAUNCH_AUTHORIZATION_MISMATCH')
+        require(not (directory / 'precom-failure.json').exists(),
+                'PRECOM_FAILURE_BEFORE_HANDOFF')
+    except BaseException as error:
+        write_precom_failure(directory, stage, reason_for(stage, error), write_new=write_new)
+        raise
+    if worker_main is None:
+        from . import worker
+        worker_main = worker.main
     return worker_main(request_path)
 
 

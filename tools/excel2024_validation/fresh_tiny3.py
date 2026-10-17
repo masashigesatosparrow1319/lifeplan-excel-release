@@ -26,15 +26,50 @@ from .common import GateError, error_info, read_json, sha, utc
 
 
 FRESH_SCHEMA = 'G2_FRESH_TINY3_ONE_SHOT_V1'
+PRECOM_SCHEMA = 'G2_FRESH_TINY3_PRECOM_FAILURE_V1'
 FRESH_LEDGER = 'lifeplan-excel2024-fresh-tiny3-approvals'
 ORIGINAL_SHA = '38c28cbceebc6bf9645b6791819cf00dce790f6f3ed3bbeb1c404bfcfa6e3682'
 APPROVAL = re.compile(r'G2-20261017-017-WIN-[0-9]{2}')
 MAX_ARCHIVE, MAX_EXPANDED, MAX_ENTRIES = 1024 * 1024, 8 * 1024 * 1024, 64
 MAX_ROWS, MAX_COLUMNS, MAX_CELLS = 64, 32, 2048
+PRECOM_STAGES = frozenset({
+    'PARENT_REQUEST_CREATE', 'PARENT_CONTROLLER_IDENTITY', 'PARENT_PROCESS_START',
+    'PARENT_LAUNCHER_IDENTITY', 'PARENT_WRAPPER_PROOF_WAIT',
+    'PARENT_WRAPPER_PROOF_READ', 'PARENT_WRAPPER_PROOF_VERIFY',
+    'PARENT_EXECUTABLE_VERIFY', 'PARENT_AUTHORIZATION',
+    'WORKER_REQUEST_PARSE', 'WORKER_CONTROL_VALIDATE', 'WORKER_MANIFEST_VALIDATE',
+    'WORKER_MARKER_VALIDATE', 'WORKER_PROFILE_VALIDATE', 'WORKER_PROCESS_IDENTITY',
+    'WORKER_PROOF_CREATE', 'WORKER_AUTHORIZATION_WAIT',
+    'WORKER_AUTHORIZATION_VALIDATE', 'WORKER_HANDOFF_CHECK', 'UNKNOWN',
+})
+PRECOM_REASONS = frozenset({
+    'REQUEST_CREATE_FAILED', 'CONTROLLER_IDENTITY_MISMATCH', 'PROCESS_START_FAILED',
+    'LAUNCHER_IDENTITY_UNAVAILABLE', 'LAUNCHER_PARENT_MISMATCH',
+    'CHILD_EXITED_WITHOUT_PROOF', 'WRAPPER_PROOF_TIMEOUT', 'PROOF_JSON_INVALID',
+    'PROOF_BINDING_MISMATCH', 'WORKER_PROCESS_MISMATCH', 'EXECUTABLE_MISMATCH',
+    'AUTHORIZATION_CREATE_FAILED', 'REQUEST_FILE_INVALID', 'REQUEST_JSON_INVALID',
+    'CONTROL_BINDING_INVALID', 'MANIFEST_INVALID', 'APPROVAL_MARKER_INVALID',
+    'PROFILE_BINDING_INVALID', 'PARENT_IDENTITY_MISMATCH',
+    'PROCESS_IDENTITY_UNAVAILABLE', 'PROOF_CREATE_FAILED', 'PARENT_STOPPED',
+    'AUTHORIZATION_TIMEOUT', 'AUTHORIZATION_INVALID',
+    'CHILD_EXITED_BEFORE_AUTHORIZATION', 'PRECOM_FAILURE_BEFORE_HANDOFF',
+    'PRECOM_UNKNOWN',
+})
+PRECOM_KEYS = frozenset({
+    'schema', 'stage', 'reason_code', 'is_precom', 'com_start_attempted', 'success',
+})
 
 
 class Blocked(Exception):
     """Fixed fail-closed reason code; CLI never echoes private arguments."""
+
+
+class PrecomBlocked(Blocked):
+    """An objectively observed pre-COM stage plus an allowlisted reason."""
+    def __init__(self, stage, reason_code):
+        value = precom_failure(stage, reason_code)
+        self.stage, self.reason_code = value['stage'], value['reason_code']
+        super().__init__(self.reason_code)
 
 
 def require(value, code):
@@ -54,6 +89,54 @@ def _write_new_json(path, value):
         json.dump(value, stream, ensure_ascii=False, sort_keys=True, indent=2, default=str)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def precom_failure(stage, reason_code):
+    """Return the complete bounded, non-identifying pre-COM failure record."""
+    if stage not in PRECOM_STAGES or reason_code not in PRECOM_REASONS:
+        stage, reason_code = 'UNKNOWN', 'PRECOM_UNKNOWN'
+    return dict(schema=PRECOM_SCHEMA, stage=stage, reason_code=reason_code,
+                is_precom=True, com_start_attempted=False, success=False)
+
+
+def write_precom_failure(directory, stage, reason_code, *, write_new=_write_new_json):
+    """Publish once.  A previous first failure is immutable and wins."""
+    value = precom_failure(stage, reason_code)
+    try:
+        write_new(Path(directory) / 'precom-failure.json', value)
+    except BaseException:
+        # Diagnostics must never replace the first failure or create a second
+        # unsafe execution path.  The parent still returns its fixed code.
+        pass
+    return value
+
+
+def read_precom_failure(directory):
+    """Read only the exact fixed schema; malformed diagnostics prove nothing."""
+    path = Path(directory) / 'precom-failure.json'
+    try:
+        if not path.is_file() or path.stat().st_size > 1024:
+            return None
+        value = read_json(path)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if (type(value) is not dict or set(value) != PRECOM_KEYS
+            or value.get('schema') != PRECOM_SCHEMA
+            or value.get('stage') not in PRECOM_STAGES
+            or value.get('reason_code') not in PRECOM_REASONS
+            or value.get('is_precom') is not True
+            or value.get('com_start_attempted') is not False
+            or value.get('success') is not False):
+        return None
+    return value
+
+
+def _precom_outcome(stage, reason_code):
+    failure = precom_failure(stage, reason_code)
+    return dict(status='BLOCKED', reason='PRECOM_FAILURE',
+                failure_stage=failure['stage'], reason_code=failure['reason_code'],
+                precom_failure=failure,
+                first_error=dict(type='PreComFailure', message=failure['reason_code']))
 
 
 def _fixed_ntfs(path, filesystem_check):
@@ -254,8 +337,10 @@ def _approval_marker(profile_path, approval_id, run_id, source_sha256):
     return marker, value
 
 
-def validate_control(request, directory, *, process_identity):
+def validate_control(request, directory, *, process_identity, observe_stage=None):
     """Worker-wrapper pre-COM gate, including the actual parent relationship."""
+    observe_stage = observe_stage or (lambda stage: None)
+    observe_stage('WORKER_CONTROL_VALIDATE')
     control = request.get('fresh_tiny3_control', {})
     approval_keys = {'schema', 'approval_id', 'run_id', 'source_sha256', 'original_sha256',
                      'profile_sha256', 'created_utc'}
@@ -266,6 +351,7 @@ def validate_control(request, directory, *, process_identity):
             and control.get('original_sha256') == ORIGINAL_SHA,
             'FRESH_CONTROL_MISMATCH')
     validate_approval_id(control.get('approval_id'))
+    observe_stage('WORKER_MANIFEST_VALIDATE')
     manifest = validate_manifest(read_json(Path(directory) / 'case.json'))
     require(set(request) == {'run_id', 'case_id', 'diagnostic', 'protocol', 'profile',
                              'profile_sha256', 'manifest_sha256', 'source_sha256',
@@ -276,6 +362,7 @@ def validate_control(request, directory, *, process_identity):
             and request.get('source_sha256') == control.get('source_sha256')
             and request.get('profile_sha256') == control.get('profile_sha256')
             and manifest['run_id'] == request['run_id'], 'FRESH_REQUEST_BINDING')
+    observe_stage('WORKER_MARKER_VALIDATE')
     marker = pre.path_check(control.get('approval_marker'), outside=True)
     require(marker.parent.name == FRESH_LEDGER and marker.name == control['approval_id'] + '.json'
             and marker.stat().st_nlink == 1 and sha(marker) == control.get('approval_marker_sha256'),
@@ -283,10 +370,12 @@ def validate_control(request, directory, *, process_identity):
     approval = read_json(marker)
     require(set(approval) == approval_keys
             and approval == {key: control[key] for key in approval_keys}, 'APPROVAL_MARKER_CONTENT')
+    observe_stage('WORKER_PROFILE_VALIDATE')
     profile_path = pre.path_check(control.get('profile_path'), outside=True)
     require(profile_path.is_file() and profile_path.stat().st_nlink == 1
             and sha(profile_path) == control['profile_sha256']
             and read_json(profile_path) == request.get('profile'), 'PROFILE_FILE_BINDING')
+    observe_stage('WORKER_PROCESS_IDENTITY')
     controller = control.get('controller', {})
     actual_parent = process_identity(os.getppid())
     require(_same_process(controller, actual_parent), 'ACTUAL_PARENT_MISMATCH')
@@ -294,44 +383,116 @@ def validate_control(request, directory, *, process_identity):
 
 
 def supervise(directory, request, *, popen=subprocess.Popen, process_identity=None,
-              clock=time.monotonic, pause=time.sleep, overall_timeout=600):
+              clock=time.monotonic, pause=time.sleep, overall_timeout=600,
+              write_new=_write_new_json):
     """Launch one wrapper, authorize its exact PID, and never terminate it."""
     from . import functions24, run
     if process_identity is None:
         process_identity = functions24.process_identity
     directory = Path(directory)
-    _write_new_json(directory / 'request.json', request)
     controller = request['fresh_tiny3_control']['controller']
-    require(_same_process(controller, process_identity(os.getpid())), 'CONTROLLER_PROCESS_CHANGED')
     started = clock()
     records, seen, in_flight = [], 0, {}
     outcome = None
     proc = None
     launcher, worker = {}, {}
+    authorized = False
+    stage = 'PARENT_REQUEST_CREATE'
+
+    def stop(stage_value, reason_code):
+        write_precom_failure(directory, stage_value, reason_code, write_new=write_new)
+        raise PrecomBlocked(stage_value, reason_code)
+
     try:
+        try:
+            write_new(directory / 'request.json', request)
+        except BaseException:
+            stop('PARENT_REQUEST_CREATE', 'REQUEST_CREATE_FAILED')
+        stage = 'PARENT_CONTROLLER_IDENTITY'
+        try:
+            actual_controller = process_identity(os.getpid())
+        except BaseException:
+            stop(stage, 'PROCESS_IDENTITY_UNAVAILABLE')
+        if not _same_process(controller, actual_controller):
+            stop(stage, 'CONTROLLER_IDENTITY_MISMATCH')
+        stage = 'PARENT_PROCESS_START'
         with (directory / 'worker-console.txt').open('x', encoding='utf-8') as console:
-            proc = popen([sys.executable, '-m', 'tools.excel2024_validation.fresh_tiny3_worker',
-                          '--request', str(directory / 'request.json')], cwd=cases.REPO,
-                         stdout=console, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-        launcher = process_identity(proc.pid)
-        require(launcher['ppid'] == controller['pid'], 'LAUNCHER_PARENT_MISMATCH')
+            try:
+                proc = popen([sys.executable, '-m', 'tools.excel2024_validation.fresh_tiny3_worker',
+                              '--request', str(directory / 'request.json')], cwd=cases.REPO,
+                             stdout=console, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            except BaseException:
+                stop(stage, 'PROCESS_START_FAILED')
+        stage = 'PARENT_LAUNCHER_IDENTITY'
+        try:
+            launcher = process_identity(proc.pid)
+        except BaseException:
+            stop(stage, 'LAUNCHER_IDENTITY_UNAVAILABLE')
+        if launcher['ppid'] != controller['pid']:
+            stop(stage, 'LAUNCHER_PARENT_MISMATCH')
+        stage = 'PARENT_WRAPPER_PROOF_WAIT'
         proof_path = directory / 'python-worker.json'
-        while not proof_path.is_file() and proc.poll() is None and clock() - started < 15:
+        failure_path = directory / 'precom-failure.json'
+        while (not proof_path.is_file() and not failure_path.is_file()
+               and proc.poll() is None and clock() - started < 15):
             pause(.05)
         if proof_path.is_file():
-            proof = read_json(proof_path)
+            stage = 'PARENT_WRAPPER_PROOF_READ'
+            try:
+                proof = read_json(proof_path)
+            except BaseException:
+                stop(stage, 'PROOF_JSON_INVALID')
+            stage = 'PARENT_WRAPPER_PROOF_VERIFY'
+            if type(proof) is not dict or set(proof) != {'schema', 'request_sha256', 'process'} \
+                    or proof.get('schema') != FRESH_SCHEMA:
+                stop(stage, 'PROOF_BINDING_MISMATCH')
             worker = proof.get('process', {})
-            require(proof.get('request_sha256') == sha(directory / 'request.json')
-                    and _same_process(launcher, worker), 'WRAPPER_PROCESS_MISMATCH')
-            require(type(worker.get('sys_executable')) is str and worker['sys_executable']
-                    and ntpath.normcase(ntpath.normpath(worker['sys_executable']))
-                    == ntpath.normcase(ntpath.normpath(worker['path'])),
-                    'PYTHON_EXECUTABLE_MISMATCH')
-            _write_new_json(directory / 'launch-authorization.json',
-                            dict(schema=FRESH_SCHEMA, request_sha256=proof['request_sha256'],
-                                 worker_sha256=sha(proof_path)))
+            if proof.get('request_sha256') != sha(directory / 'request.json'):
+                stop(stage, 'PROOF_BINDING_MISMATCH')
+            if not _same_process(launcher, worker):
+                stop(stage, 'WORKER_PROCESS_MISMATCH')
+            stage = 'PARENT_EXECUTABLE_VERIFY'
+            if (type(worker.get('sys_executable')) is not str or not worker['sys_executable']
+                    or ntpath.normcase(ntpath.normpath(worker['sys_executable']))
+                    != ntpath.normcase(ntpath.normpath(worker['path']))):
+                stop(stage, 'EXECUTABLE_MISMATCH')
+            stage = 'PARENT_AUTHORIZATION'
+
+            def authorization_signals():
+                """First failure wins: child record, STOP, then observed exit."""
+                if failure_path.exists():
+                    child_failure = read_precom_failure(directory)
+                    if child_failure is None:
+                        stop(stage, 'PRECOM_UNKNOWN')
+                    raise PrecomBlocked(child_failure['stage'], child_failure['reason_code'])
+                if (directory / 'STOP').exists():
+                    stop(stage, 'PARENT_STOPPED')
+                if proc.poll() is not None:
+                    stop(stage, 'CHILD_EXITED_BEFORE_AUTHORIZATION')
+
+            authorization_signals()
+            try:
+                current_worker = process_identity(proc.pid)
+            except BaseException:
+                stop(stage, 'PROCESS_IDENTITY_UNAVAILABLE')
+            if not _same_process(worker, current_worker):
+                stop(stage, 'WORKER_PROCESS_MISMATCH')
+            # STOP/failure may arrive while liveness is being observed.
+            authorization_signals()
+            try:
+                write_new(directory / 'launch-authorization.json',
+                          dict(schema=FRESH_SCHEMA, request_sha256=proof['request_sha256'],
+                               worker_sha256=sha(proof_path)))
+            except BaseException:
+                stop(stage, 'AUTHORIZATION_CREATE_FAILED')
+            authorized = True
         else:
-            outcome = dict(status='BLOCKED', reason='WRAPPER_HANDSHAKE_MISSING')
+            child = read_precom_failure(directory)
+            if child is not None:
+                raise PrecomBlocked(child['stage'], child['reason_code'])
+            if proc.poll() is not None:
+                stop(stage, 'CHILD_EXITED_WITHOUT_PROOF')
+            stop(stage, 'WRAPPER_PROOF_TIMEOUT')
         while outcome is None:
             records = run.events(directory / 'progress.jsonl')
             for event in records[seen:]:
@@ -360,16 +521,26 @@ def supervise(directory, request, *, popen=subprocess.Popen, process_identity=No
                     outcome.update(status='FAIL', reason='WORKER_EXIT_CODE_MISMATCH')
                 break
             pause(.1)
+    except PrecomBlocked as error:
+        (directory / 'STOP').touch(exist_ok=True)
+        outcome = _precom_outcome(error.stage, error.reason_code)
     except BaseException as error:
         (directory / 'STOP').touch(exist_ok=True)
-        outcome = dict(status=error.status if isinstance(error, GateError) else 'BLOCKED',
-                       reason='SUPERVISOR_HANDSHAKE_OR_MONITOR_FAILURE', first_error=error_info(error))
+        if not authorized:
+            failure = write_precom_failure(directory, stage, 'PRECOM_UNKNOWN', write_new=write_new)
+            outcome = _precom_outcome(failure['stage'], failure['reason_code'])
+        else:
+            outcome = dict(status=error.status if isinstance(error, GateError) else 'BLOCKED',
+                           reason='SUPERVISOR_MONITOR_FAILURE', first_error=error_info(error))
     if outcome.get('status') in ('TIMEOUT', 'INTERRUPTED', 'FAIL', 'BLOCKED'):
         (directory / 'STOP').touch(exist_ok=True)
     still_running = proc is not None and proc.poll() is None
     proof = dict(controller=controller, launcher=launcher, worker=worker)
     if not still_running and worker:
-        proof['worker_exit'] = functions24.worker_exit_observation(worker)
+        try:
+            proof['worker_exit'] = functions24.worker_exit_observation(worker)
+        except BaseException:
+            proof['worker_exit'] = dict(outcome='EXIT_OBSERVATION_FAILED')
     outcome.update(worker_pid=proc.pid if proc else None, worker_still_running=still_running,
                    cleanup_pending=still_running, force_termination=False,
                    python_processes=proof, progress_event_count=len(records))
@@ -435,6 +606,11 @@ def execute(config, output, expected_source_sha, approval_id, *, confirmed=False
         result.update(excel_started=runtime.get('identity') is not None,
                       com_connected=runtime.get('observed_identity') is not None,
                       runtime_status=runtime.get('status'), worker_still_running=runtime.get('worker_still_running'))
+        if runtime.get('precom_failure'):
+            failure = runtime['precom_failure']
+            result.update(reason='PRECOM_FAILURE', failure_stage=failure.get('stage'),
+                          reason_code=failure.get('reason_code'), precom_failure=failure,
+                          first_error=runtime.get('first_error'))
         if runtime.get('status') != 'SAVED_REOPENED':
             status = runtime.get('status')
             raise GateError(status if status in ('BLOCKED', 'TIMEOUT', 'INTERRUPTED', 'FAIL') else 'FAIL',
@@ -462,8 +638,12 @@ def execute(config, output, expected_source_sha, approval_id, *, confirmed=False
     except Blocked as error:
         result['reason'] = str(error)
     except GateError as error:
-        result.update(status=error.status if error.status in ('BLOCKED', 'TIMEOUT') else 'FAIL',
-                      reason='RUNTIME_GATE_FAILURE', first_error=error_info(error), exit_code=2 if error.status == 'BLOCKED' else 1)
+        status = error.status if error.status in ('BLOCKED', 'TIMEOUT') else 'FAIL'
+        if result.get('precom_failure'):
+            result.update(status=status, exit_code=2 if status == 'BLOCKED' else 1)
+        else:
+            result.update(status=status, reason='RUNTIME_GATE_FAILURE',
+                          first_error=error_info(error), exit_code=2 if status == 'BLOCKED' else 1)
     except BaseException:
         # Do not expose profile paths, approval values, exception text, or run UUIDs on the CLI.
         result.update(status='FAIL', reason='FRESH_TINY3_VALIDATION_FAILED', exit_code=1)
@@ -492,6 +672,7 @@ def main(argv=None):
                      product_acceptance=False, next_action='STOP_PM_REVIEW')
     public = {key: value.get(key) for key in ('schema', 'status', 'reason', 'success', 'exit_code',
               'case_id', 'runtime_status', 'diagnostic_only', 'diagnostic_recalculation_verified',
+              'failure_stage', 'reason_code',
               'p1_status', 'annual1_status', 'gate2_acceptance', 'product_acceptance',
               'force_termination', 'worker_still_running', 'next_action')}
     print(json.dumps(public, ensure_ascii=False))
