@@ -1,0 +1,22 @@
+[
+  {
+    "file": "01_function_gate.xlsx",
+    "sha256": "ea158ca2052c1c2ba4d5b7bd30e4304846770e82392bea4229506d973f131e21",
+    "bytes": 10137,
+    "formula_cells": 24,
+    "shared": 0,
+    "arrays": 0,
+    "nonempty_caches": 0,
+    "max_formula_chars": 97
+  },
+  {
+    "file": "02_monthly_cases.xlsx",
+    "sha256": "b18467847dfe6cc115652c1fa51ac6cfb5dabe982edc8850c1d2cba3b74fbeec",
+    "bytes": 337885,
+    "formula_cells": 22600,
+    "shared": 0,
+    "arrays": 0,
+    "nonempty_caches": 0,
+    "max_formula_chars": 108
+  }
+]

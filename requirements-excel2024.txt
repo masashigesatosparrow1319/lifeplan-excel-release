@@ -1,0 +1,4 @@
+-r requirements-dev.txt
+# Windows-only validation dependencies, not product workbook dependencies.
+pywin32==311; sys_platform == "win32"
+psutil==7.0.0; sys_platform == "win32"

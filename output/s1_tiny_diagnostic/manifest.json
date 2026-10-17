@@ -1,0 +1,32 @@
+{
+  "schema": "S1-tiny-com-diagnostic-v1",
+  "spec": {
+    "file": "tiny_calc.xlsx",
+    "sheet": "診断",
+    "formula_count": 3,
+    "inputs_before": {
+      "A1": 2,
+      "A2": 3
+    },
+    "inputs_after": {
+      "A1": 7,
+      "A2": 3
+    },
+    "formulas": {
+      "B1": "=A1+A2",
+      "B2": "=A1*A2",
+      "B3": "=SUM(B1:B2)"
+    },
+    "expected_before": {
+      "B1": 5,
+      "B2": 6,
+      "B3": 11
+    },
+    "expected_after": {
+      "B1": 10,
+      "B2": 21,
+      "B3": 31
+    }
+  },
+  "sha256": "38c28cbceebc6bf9645b6791819cf00dce790f6f3ed3bbeb1c404bfcfa6e3682"
+}
